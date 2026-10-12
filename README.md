@@ -206,26 +206,38 @@ credit one model's generation to another, which is worse than a coarser signal.
 
 ## Window controls
 
-Header, left to right:
+The overlay has no title bar — it is nothing but cards. Its two window buttons
+sit in the header row of whichever card is on top, and move with it if that
+card is hidden:
 
-- **STOP** — unloads the *local* models and stops the local Ollama server. **Click twice**:
-  the first click arms it (`SURE?`, red) and it disarms itself after 3.5s, so a
-  stray click can't end your session. It unloads first so runners release VRAM
-  cleanly, then terminates the runners, `ollama serve`, and the desktop/tray
-  app if present (that app supervises the server and would otherwise restart
-  it). Termination is graceful first, hard-killed only if a process won't exit.
-  Restart Ollama afterwards with `ollama serve` or by launching the Ollama app.
-  - **On Linux**, the official installer runs Ollama as `ollama.service` with
-    `Restart=always`, so killing the process wouldn't stick. STOP instead runs
-    `systemctl stop ollama`.
-  - That needs root. It's tried non-interactively first; if that's refused,
-    it goes through `pkexec`, which shows your desktop's password prompt.
-- **⚙** — open Settings & dashboard.
-- **–** — collapse to just the header bar; data keeps updating underneath.
-  Click again (`+`) to restore.
+- **–** — collapse every card to its header row. The window shrinks to a thin
+  strip (290px tall down to 80px with two cards) that still shows each card's
+  name and status, and still carries the buttons. Click again (`+`) to restore.
+  Each card also has its own `▾` to collapse just that one.
 - **×** — hide the overlay. It does **not** quit: the app keeps running and the
   tray icon brings it back. Once hidden by hand it stays hidden — a model
   loading won't pop it back up uninvited.
+
+Everything else is on the **right-click menu**, anywhere on the overlay, and in
+the tray icon's menu:
+
+- **Settings & dashboard…**
+- **Unload local models** — frees VRAM, leaves the server up.
+- **Stop local Ollama server…** — asks for confirmation first, since it ends
+  every warm model. It unloads first so runners release VRAM cleanly, then
+  terminates the runners, `ollama serve`, and the desktop/tray app if present
+  (that app supervises the server and would otherwise restart it). Termination
+  is graceful first, hard-killed only if a process won't exit. Restart Ollama
+  afterwards with `ollama serve` or by launching the Ollama app.
+  - **On Linux**, the official installer runs Ollama as `ollama.service` with
+    `Restart=always`, so killing the process wouldn't stick. It instead runs
+    `systemctl stop ollama`.
+  - That needs root. It's tried non-interactively first; if that's refused,
+    it goes through `pkexec`, which shows your desktop's password prompt.
+- **Collapse / Expand**, **Hide overlay**, **Quit overlay**.
+
+With every card switched off there is nothing to draw and nowhere to put the
+buttons, so the overlay hides itself and the tray icon is the way back.
 
 Drag the overlay anywhere by clicking and holding it. Once moved it stays put
 instead of re-snapping to its corner; double-click it to snap back.
@@ -266,7 +278,8 @@ use the ⚙ button on the HUD.
 
 ## What's here
 
-- `app.py` — `OverlayHUD` (header strip plus one `HostCard` per host),
+- `app.py` — `OverlayHUD` (a title-bar-less stack of cards; the window buttons
+  are re-parented into whichever card is on top),
   `Toast`, `TrayController`, `SharingManager`, and `main()` wiring it all
   together.
 - `widgets.py` — `HostCard` (coloured border, name tag, kind badge, tag pills,
@@ -299,6 +312,9 @@ use the ⚙ button on the HUD.
 - `model_state.py` — runner discovery (`RunnerIndex`), the background
   `SlotsSampler` that polls each runner's `/slots` every 100ms for busy state
   and speed, and `NvmlActivityProbe` for the GPU-utilization fallback.
+- `claude_watch.py` — `ClaudeWatcher`: the session registry reader, the desktop
+  app detector, and `UsageIndex`, the incremental transcript scanner behind the
+  token figures.
 - `ollama_control.py` — `unload_models()`, `stop_ollama()`, and the
   `OllamaController` that runs both off the UI thread.
 - `gpu_stats.py` — `GPUStats` + `GPUReader` implementations:
@@ -388,6 +404,95 @@ write `%LOCALAPPDATA%\Ollama\server.log` at all. If you're on an older Ollama
 and `/slots` is disabled, that path can still supply a number, with the caveat
 that its model attribution is a guess when two models are warm at once.
 
+## Claude sessions and usage
+
+Below the host cards, an optional **CLAUDE** card reports what Claude is doing
+on this machine: whether the desktop app is open, every live Claude Code
+session with the folder-or-title it's working on, and how many tokens have gone
+through them. A session that is generating reads green and says `BUSY`; one
+waiting for input reads amber and says `IDLE` — the same colour vocabulary the
+model rows use, so the whole overlay is read the same way.
+
+```
+CLAUDE                      2 busy · 6 sessions
+● Nvidia PhysX Nemo over…                  BUSY
+● Ollama app multi-model…                  BUSY
+● 23-1d                                    IDLE
++2 more
+5h                          1.8M out · 7.3M in
+7d                          4.8M out · 23.4M in
+```
+
+Hover the card for the full breakdown: cache-read tokens, reply counts, today's
+figures, and the top models by output volume.
+
+**By default the card only appears while Ollama has nothing loaded.** The
+overlay is for what's running right now, and when models are warm that's the
+interesting half; the Claude card steps aside and comes back the moment the
+last model unloads. A model that is merely pinned or lingering as `STOPPED`
+doesn't count as running, so those don't suppress it.
+
+Two details worth knowing:
+
+- The rule looks at the host cards you actually display. If you've switched the
+  local card off, you've opted out of watching Ollama, so a model loading won't
+  hide Claude — otherwise the overlay would empty itself.
+- Settings → General → *Claude* → "Only when no Ollama model is loaded" turns
+  this off, and then both cards are shown together.
+
+### What the numbers are — and what they aren't
+
+**This is measured token volume, not a percentage of your plan.** The
+plan-limit percentage is computed server-side and Claude Code only renders it
+in its own `/usage` view; nothing on disk caches it, so any percentage shown
+here would be invented. For the real figure, run `/usage` inside Claude Code.
+
+What the card counts is what Claude Code wrote to its own transcripts:
+
+| Figure | Meaning |
+| --- | --- |
+| `out` | Output tokens generated |
+| `in` | Fresh input — prompt tokens plus cache *writes* |
+| cache-read (tooltip) | Tokens served from the prompt cache, far and away the largest number and the cheapest |
+
+The two windows are `5h` and `7d` because those mirror the windows Claude's own
+limits use — a rolling session window and a weekly one.
+
+### Where it reads from
+
+Three local sources, all files Claude Code already maintains. No network calls,
+and `~/.claude/.credentials.json` is never opened.
+
+- `~/.claude/sessions/<pid>.json` — the live session registry: pid, working
+  directory, a readable name, and a `busy`/`idle` status. It is **not**
+  self-cleaning, so every entry is checked against the process table before
+  being believed; each file records the process start time, which matches
+  psutil's `create_time` exactly, so a recycled pid can't resurrect a session
+  that ended days ago.
+- The process table, for the desktop app. Electron runs one main process plus
+  a dozen-odd helpers, so the card reports *one app* and counts the helpers
+  separately rather than claiming fourteen instances.
+- `~/.claude/projects/*/*.jsonl` — the transcripts, whose assistant records
+  carry a `usage` block and a timestamp.
+
+Transcripts are append-only, so each file is read once and then only from where
+the last pass stopped, and the hourly totals are cached in the config folder so
+a restart doesn't re-read the backlog. Measured here: a first pass over 160
+files took 0.65s, and steady-state passes take about 4ms. Files older than
+eight days are never opened.
+
+### Settings
+
+Settings → **General** → *Claude*: turn the card off (which also stops its
+watcher thread), set the border colour, how many session rows to show before
+`+N more`, and how often to rescan. "Keep the overlay up while a session is
+generating" lets a busy Claude session hold the HUD open the way an active
+model does — idle sessions deliberately don't, or the overlay would never
+auto-hide, since the desktop app tends to be open all day.
+
+Session names come from conversation titles, so they appear on screen; turn the
+card off if that's not wanted on a shared display.
+
 ## Known limitations
 
 - **`/slots` is not a public API.** It's llama.cpp's endpoint, exposed by the
@@ -403,6 +508,16 @@ that its model attribution is a guess when two models are warm at once.
   less chatter. A runner that stops answering is skipped for 5s rather than
   retried every cycle. The UI's own tick (`/api/ps`, roster refresh) stays on
   the UI thread at 300ms while generating and 1.5s otherwise.
+- **Claude's plan-limit percentage isn't available locally.** The card shows
+  measured token volume instead; `/usage` inside Claude Code is the only place
+  the real percentage exists. Token counts also cover only sessions run on this
+  machine, under this user account.
+- **Claude session detection depends on files Claude Code writes for itself.**
+  `~/.claude/sessions/*.json` and the transcript format are internal, not a
+  published API; a future Claude Code release could change either, at which
+  point the card would show no sessions or stale token totals rather than
+  wrong ones. `psutil` is required to verify sessions are live and to detect
+  the desktop app.
 - **STOP is machine-wide, not instance-scoped.** It matches Ollama processes
   by name, so it stops every local Ollama server, not only the one on the port
   the overlay is watching. That's the intended behaviour for a single local

@@ -77,6 +77,21 @@ DEFAULTS = {
     "behavior": {
         "auto_hide_when_idle": True,
     },
+    "claude": {
+        "show": True,            # the Claude card in the overlay
+        "color": "#D97757",
+        "max_sessions": 4,       # session rows before "+N more"
+        # Keep the card out of the way while Ollama is actually working: it
+        # appears only when no model is resident. Models that are merely pinned
+        # or lingering as STOPPED don't count as running.
+        "only_when_idle": True,
+        "usage_refresh_s": 15,   # transcript rescan cadence (incremental)
+        # A session actually generating counts as something worth seeing, so it
+        # can hold the overlay open the same way an active model does. Idle
+        # sessions don't, otherwise the HUD would never auto-hide: the desktop
+        # app tends to be open all day.
+        "show_when_busy": True,
+    },
     "sharing": {
         "enabled": False,
         "bind": "0.0.0.0",

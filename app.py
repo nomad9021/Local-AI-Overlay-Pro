@@ -13,9 +13,10 @@ STOPPED), eviction countdown and live tok/s, plus GPU%/VRAM where available.
 A toast fires on local load/switch/unload transitions and, if enabled, on
 remote hosts going offline/online or loading models.
 
-Header controls, left to right: STOP (unloads the local models and stops the
-local Ollama server — click twice to confirm), ⚙ (settings & dashboard),
-– (collapse to the header bar), × (hide; the tray icon brings it back).
+There is no title bar: the – (collapse every card to its header row) and ×
+(hide; the tray icon brings it back) buttons live in the top card's own header.
+Stopping the server, unloading models, settings and quit are on the right-click
+menu and in the tray menu.
 
 To make *this* machine visible to overlays elsewhere, turn on Settings ->
 Sharing (or run agent.py headless on a server); see status_server.py.
@@ -36,8 +37,8 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
 from PySide6.QtGui import QGuiApplication, QFont, QColor, QIcon, QPixmap, QPainter, QBrush, QAction
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QBoxLayout, QLayout, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QPushButton,
-    QSystemTrayIcon, QMenu,
+    QApplication, QBoxLayout, QLayout, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
+    QMessageBox, QSystemTrayIcon, QMenu,
 )
 
 import theme
@@ -52,20 +53,32 @@ from remote import RemotePoller
 from settings import LOCAL_ID, Settings
 from status_server import StatusServer, build_snapshot
 from theme import ACCENT, BORDER, DANGER, IDLE_GREY, LABEL_GRAY, mono
-from widgets import HostCard, status_text_for
+from claude_watch import ClaudeWatcher
+from widgets import ClaudeCard, HostCard, WindowControls, status_text_for
 
 
 class OverlayHUD(QWidget):
-    """Always-on-top HUD: a header strip plus one HostCard per watched host."""
+    """Always-on-top HUD: nothing but cards.
+
+    There is no title bar. The minimise and close buttons are a single
+    `WindowControls` widget that is re-parented into the header row of whichever
+    card is on top, so the overlay costs no vertical space on chrome. Everything
+    the old header strip also carried — stop the server, unload models,
+    settings, quit — is on the right-click menu and in the tray menu.
+    """
 
     hideRequested = Signal()
     stopRequested = Signal()
+    unloadRequested = Signal()
     settingsRequested = Signal()
+    quitRequested = Signal()
 
     def __init__(self, settings: Settings, hub: StatusHub):
         super().__init__()
         self._settings = settings
         self._hub = hub
+        self._claude_card = None
+        self._claude_status = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
@@ -85,50 +98,22 @@ class OverlayHUD(QWidget):
         outer.setSpacing(6)
         outer.setSizeConstraint(QLayout.SetFixedSize)
 
-        # Header strip: aggregate dot + "OLLAMA" + summary + controls
-        self.header_card = QFrame()
-        self.header_card.setObjectName("headercard")
-        header = QHBoxLayout(self.header_card)
-        header.setContentsMargins(14, 8, 12, 8)
-        self.dot = QLabel("●")
-        self.dot.setStyleSheet(f"color: {IDLE_GREY}; font-size: 10px;")
-        tag = QLabel("OLLAMA")
-        tag.setStyleSheet(f"color: {LABEL_GRAY}; letter-spacing: 2px;")
-        tag.setFont(mono(8, QFont.DemiBold))
-        self.summary_label = QLabel("")
-        self.summary_label.setStyleSheet(f"color: {LABEL_GRAY};")
-        self.summary_label.setFont(mono(7))
-        header.addWidget(self.dot)
-        header.addWidget(tag)
-        header.addSpacing(4)
-        header.addWidget(self.summary_label)
-        header.addStretch()
+        # The overlay's own window buttons. They have no bar of their own:
+        # _attach_window_controls() moves them into the top card's header.
+        self.window_controls = WindowControls()
+        self.window_controls.minimizeToggled.connect(self.toggle_minimize)
+        self.window_controls.closeClicked.connect(lambda: self.hideRequested.emit())
 
-        self.stop_btn = QPushButton("STOP")
-        self.stop_btn.setCursor(Qt.PointingHandCursor)
-        self.stop_btn.setFont(mono(7, QFont.DemiBold))
-        self.stop_btn.setFixedHeight(16)
-        self._style_stop_btn(armed=False)
-        self.stop_btn.clicked.connect(self._on_stop_clicked)
-        header.addWidget(self.stop_btn)
-        header.addSpacing(4)
+        # Right-click anywhere on the overlay for what the header strip used to
+        # carry as buttons.
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
-        # A STOP that fires on one click is a session-ender one stray click away,
-        # so the first click only arms it; it disarms itself if not confirmed.
-        self._disarm_timer = QTimer(self)
-        self._disarm_timer.setSingleShot(True)
-        self._disarm_timer.timeout.connect(lambda: self._set_stop_armed(False))
-
-        self.settings_btn = self._header_button("⚙", 12, lambda *_: self.settingsRequested.emit(),
-                                                "Settings & dashboard")
-        header.addWidget(self.settings_btn)
-        self.minimize_btn = self._header_button("–", 13, self.toggle_minimize,
-                                                "Collapse to the header bar")
-        header.addWidget(self.minimize_btn)
-        self.close_btn = self._header_button("×", 15, lambda *_: self.hideRequested.emit(),
-                                             "Hide the overlay (tray icon keeps it running)")
-        header.addWidget(self.close_btn)
-        outer.addWidget(self.header_card)
+        self.claude_box = QWidget()
+        claude_layout = QVBoxLayout(self.claude_box)
+        claude_layout.setContentsMargins(0, 0, 0, 0)
+        claude_layout.setSpacing(0)
+        self.claude_layout = claude_layout
 
         self.cards_box = QWidget()
         self.cards_layout = QBoxLayout(QBoxLayout.TopToBottom, self.cards_box)
@@ -136,6 +121,7 @@ class OverlayHUD(QWidget):
         self.cards_layout.setSpacing(6)
         self.cards_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         outer.addWidget(self.cards_box)
+        outer.addWidget(self.claude_box)
 
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
         self.setWindowOpacity(0.0)
@@ -153,64 +139,34 @@ class OverlayHUD(QWidget):
 
     # ---- header controls -------------------------------------------------- #
 
-    def _header_button(self, glyph, size, slot, tooltip):
-        btn = QPushButton(glyph)
-        btn.setFixedSize(16, 16)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setToolTip(tooltip)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {LABEL_GRAY};
-                border: none;
-                font-size: {size}px;
-                font-weight: bold;
-                padding: 0;
-            }}
-            QPushButton:hover {{
-                color: white;
-            }}
-        """)
-        btn.clicked.connect(slot)
-        return btn
+    def _show_context_menu(self, pos):
+        """What the header strip's buttons used to do, on right-click."""
+        menu = QMenu(self)
+        menu.addAction("Settings & dashboard…", lambda: self.settingsRequested.emit())
+        menu.addSeparator()
+        menu.addAction("Unload local models", lambda: self.unloadRequested.emit())
+        stop = menu.addAction("Stop local Ollama server…",
+                              lambda: self._confirm_stop())
+        stop.setToolTip("Unloads the models and kills the Ollama server")
+        menu.addSeparator()
+        menu.addAction("Collapse" if not self._minimized else "Expand", self.toggle_minimize)
+        menu.addAction("Hide overlay", lambda: self.hideRequested.emit())
+        menu.addAction("Quit overlay", lambda: self.quitRequested.emit())
+        menu.exec(self.mapToGlobal(pos))
 
-    def _style_stop_btn(self, armed: bool):
-        colour = DANGER if armed else LABEL_GRAY
-        border = DANGER if armed else "rgba(255, 255, 255, 40)"
-        self.stop_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {colour};
-                border: 1px solid {border};
-                border-radius: 5px;
-                padding: 0 4px;
-            }}
-            QPushButton:hover {{
-                color: {DANGER};
-                border: 1px solid {DANGER};
-            }}
-        """)
-        self.stop_btn.setToolTip(
-            "Click again to unload models and stop the local Ollama server"
-            if armed else "Unload models and stop the local Ollama server"
+    def _confirm_stop(self):
+        """Stopping the server ends every warm model, so it asks first.
+
+        The old header button armed itself on a first click; from a menu a
+        plain confirmation dialog is clearer and costs the same one extra click.
+        """
+        answer = QMessageBox.question(
+            self, "Stop Ollama?",
+            "Unload the local models and stop the Ollama server?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
-
-    def _set_stop_armed(self, armed: bool):
-        self._stop_armed = armed
-        self.stop_btn.setText("SURE?" if armed else "STOP")
-        self._style_stop_btn(armed)
-        self._resize_to_content()
-
-    def _on_stop_clicked(self):
-        if self._stop_armed:
-            self._disarm_timer.stop()
-            self._set_stop_armed(False)
+        if answer == QMessageBox.Yes:
             self.stopRequested.emit()
-        else:
-            self._set_stop_armed(True)
-            self._disarm_timer.start(3500)
-
-    # ---- settings / cards ------------------------------------------------- #
 
     def apply_settings(self):
         look = self._settings.section("appearance")
@@ -218,15 +174,6 @@ class OverlayHUD(QWidget):
                                look.get("state_stopped"))
         horizontal = look.get("layout") == "horizontal"
         self.cards_layout.setDirection(QBoxLayout.LeftToRight if horizontal else QBoxLayout.TopToBottom)
-        alpha = int(look.get("opacity", 175))
-        radius = int(look.get("border_radius", 14))
-        self.header_card.setStyleSheet(f"""
-            #headercard {{
-                background: rgba(18, 18, 20, {alpha});
-                border: 1px solid {BORDER};
-                border-radius: {min(radius, 12)}px;
-            }}
-        """)
         self.sync_cards()
 
     def _wanted_cards(self) -> list:
@@ -249,7 +196,9 @@ class OverlayHUD(QWidget):
             if card is None:
                 card = HostCard(host_id, width=int(look.get("width", 272)))
                 card.collapseToggled.connect(self._on_card_collapsed)
-                card.set_collapsed(host_id in self._collapsed)
+                # A card rebuilt while the overlay is minimised must come back
+                # collapsed, or a settings change would silently un-minimise it.
+                card.set_collapsed(self._minimized or host_id in self._collapsed)
                 self._cards[host_id] = card
             self.cards_layout.insertWidget(index, card, 0, Qt.AlignTop | Qt.AlignLeft)
             ident = self._settings.identity(host_id)
@@ -263,7 +212,106 @@ class OverlayHUD(QWidget):
                 show_gpu=bool(look.get("show_gpu", True)),
             )
             self._refresh_card(host_id)
+        self.sync_claude_card()
+        self._attach_window_controls()
         self._after_update()
+
+    def sync_claude_card(self):
+        """Create, update or drop the Claude card to match the setting."""
+        conf = self._settings.section("claude")
+        look = self._settings.section("appearance")
+        if not conf.get("show", True):
+            if self._claude_card is not None:
+                self.claude_layout.removeWidget(self._claude_card)
+                self._claude_card.deleteLater()
+                self._claude_card = None
+            self.claude_box.setVisible(False)
+            return
+
+        if self._claude_card is None:
+            self._claude_card = ClaudeCard(width=int(look.get("width", 272)))
+            self.claude_layout.addWidget(self._claude_card)
+        self.claude_box.setVisible(True)
+        self._claude_card.set_appearance(
+            width=int(look.get("width", 272)),
+            border_width=int(look.get("border_width", 1)),
+            radius=int(look.get("border_radius", 14)),
+            alpha=int(look.get("opacity", 175)),
+            colour=conf.get("color", "#D97757"),
+            max_sessions=int(conf.get("max_sessions", 4)),
+        )
+        if self._claude_status is not None:
+            self._claude_card.set_status(self._claude_status)
+        self._claude_card.set_collapsed(self._minimized)
+        self._update_claude_visibility()
+
+    def _models_loaded(self) -> bool:
+        """Is any shown host actually holding a model in memory?
+
+        STOPPED rows don't count: a pinned model that isn't loaded, or one still
+        lingering on the roster after being unloaded, is not Ollama working.
+        """
+        for host_id in self._cards:
+            status = self._hub.status(host_id)
+            if status is None or not status.reachable:
+                continue
+            if any(row.state is not ModelState.STOPPED for row in status.rows):
+                return True
+        return False
+
+    def _claude_visible(self) -> bool:
+        conf = self._settings.section("claude")
+        if not conf.get("show", True) or self._claude_card is None:
+            return False
+        if conf.get("only_when_idle", True) and self._models_loaded():
+            return False
+        return True
+
+    def _update_claude_visibility(self):
+        """Re-evaluated on every hub update, so the card steps aside the moment
+        a model loads and comes back when the last one goes."""
+        self.claude_box.setVisible(self._claude_visible())
+
+    def _all_cards(self) -> list:
+        cards = list(self._cards.values())
+        if self._claude_card is not None:
+            cards.append(self._claude_card)
+        return cards
+
+    def _visible_cards(self) -> list:
+        """Cards actually on screen, top first — the controls must land on one
+        of these, never on a card that is hidden."""
+        cards = [self._cards[hid] for hid in self._wanted_cards() if hid in self._cards]
+        if self._claude_visible():
+            cards.append(self._claude_card)
+        return cards
+
+    def _attach_window_controls(self):
+        """Move the minimise/close buttons into whichever card is on top.
+
+        Re-parenting is how a single instance follows the top card around:
+        addWidget() takes ownership away from the previous header, so the
+        buttons can never end up drawn twice.
+        """
+        visible = self._visible_cards()
+        top = visible[0] if visible else None
+        if top is not None:
+            top.set_window_controls(self.window_controls)
+        else:
+            self.window_controls.setParent(None)
+
+    def on_claude_status(self, status):
+        self._claude_status = status
+        if self._claude_card is not None:
+            self._claude_card.set_status(status)
+            self._resize_to_content()
+        self._update_presence()
+
+    def _claude_is_busy(self) -> bool:
+        conf = self._settings.section("claude")
+        if not (conf.get("show_when_busy", True) and self._claude_visible()):
+            return False
+        return bool(self._claude_status and self._claude_status.busy_sessions)
 
     def _on_card_collapsed(self, host_id: str, collapsed: bool):
         if collapsed:
@@ -291,17 +339,13 @@ class OverlayHUD(QWidget):
         self._after_update()
 
     def _after_update(self):
-        all_rows = []
-        online = total = 0
-        for host_id in self._cards:
-            status = self._hub.status(host_id)
-            if host_id != LOCAL_ID:
-                total += 1
-                online += 1 if status is not None and status.reachable else 0
-            if status is not None and status.reachable:
-                all_rows.extend(status.rows)
-        self.dot.setStyleSheet(f"color: {theme.aggregate_colour(all_rows)}; font-size: 10px;")
-        self.summary_label.setText(f"{online}/{total} hosts up" if total else "")
+        # Models may have just loaded or cleared, which is what decides whether
+        # the Claude card belongs on screen.
+        self._update_claude_visibility()
+        self._attach_window_controls()
+        # The aggregate state the header dot used to show now rides on the tray
+        # icon, which TrayController recolours from the same hub data, and on
+        # each card's own dot.
         self._update_presence()
         self._resize_to_content()
 
@@ -312,9 +356,14 @@ class OverlayHUD(QWidget):
         remote server being *offline* is exactly the thing worth seeing.
         """
         auto_hide = self._settings.section("behavior").get("auto_hide_when_idle", True)
-        content = (not auto_hide) or any(
-            hid != LOCAL_ID or card.has_rows for hid, card in self._cards.items()
-        )
+        if not self._visible_cards():
+            # Every card switched off: there is nothing to draw and no window
+            # buttons to draw it with, so don't float an empty frame.
+            content = False
+        else:
+            content = (not auto_hide) or self._claude_is_busy() or any(
+                hid != LOCAL_ID or card.has_rows for hid, card in self._cards.items()
+            )
         if content:
             self._forced_visible = False
         if content and not self._present:
@@ -333,14 +382,17 @@ class OverlayHUD(QWidget):
     # ---- geometry ----------------------------------------------------------- #
 
     def _resize_to_content(self):
-        horizontal = self._settings.section("appearance").get("layout") == "horizontal"
-        width = int(self._settings.section("appearance").get("width", 272))
-        cards = len(self._cards)
-        if horizontal and cards:
-            span = cards * width + (cards - 1) * self.cards_layout.spacing()
-        else:
-            span = width
-        self.header_card.setFixedWidth(span)
+        # Collapsing a card hides its body, which drops the card's sizeHint but
+        # does not by itself shrink the card: the nested layouts have to be
+        # re-activated from the inside out, or the overlay keeps the dead
+        # vertical space where the body used to be.
+        for card in self._all_cards():
+            card.layout().activate()
+            card.adjustSize()
+        for box in (self.cards_box, self.claude_box):
+            if box.layout() is not None:
+                box.layout().activate()
+            box.adjustSize()
         self.layout().activate()
         self.adjustSize()
         if not self._user_moved:
@@ -354,9 +406,16 @@ class OverlayHUD(QWidget):
         self.move(x, y)
 
     def toggle_minimize(self):
+        """Collapse every card to its header row, and back.
+
+        With no title bar left to shrink to, collapsing hides each card's body
+        instead of the whole stack — which keeps the window buttons, and each
+        card's own name and status, on screen while minimised.
+        """
         self._minimized = not self._minimized
-        self.minimize_btn.setText("+" if self._minimized else "–")
-        self.cards_box.setVisible(not self._minimized)
+        self.window_controls.set_minimized(self._minimized)
+        for card in self._all_cards():
+            card.set_collapsed(self._minimized)
         self._resize_to_content()
 
     def mousePressEvent(self, event):
@@ -842,11 +901,17 @@ def main(argv=None):
         poller.set_interval(float(settings.data.get("remote_poll_interval_s", 3)))
         poller.set_hosts(settings.hosts())
         sharing.apply()
+        # Turning the Claude card off stops its watcher thread too: no point
+        # walking the process table and re-reading transcripts for a hidden card.
+        if settings.section("claude").get("show", True):
+            claude_watcher.start()
+        else:
+            claude_watcher.stop()
 
     settings.changed.connect(apply_runtime_settings)
 
     def quit_app():
-        for stopper in (monitor.stop, poller.stop, sharing.stop):
+        for stopper in (monitor.stop, poller.stop, sharing.stop, claude_watcher.stop):
             try:
                 stopper()
             except Exception:
@@ -867,11 +932,14 @@ def main(argv=None):
         # No notification area (some minimal Linux WMs, GNOME without the
         # AppIndicator extension): × has to mean quit, otherwise it would hide
         # the window with no way to get it back.
-        overlay.close_btn.setToolTip("Quit the overlay (no system tray available)")
+        overlay.window_controls.close_btn.setToolTip(
+            "Quit the overlay (no system tray available)")
         overlay.hideRequested.connect(quit_app)
 
     overlay.settingsRequested.connect(open_settings)
     overlay.stopRequested.connect(controller.stop_async)
+    overlay.unloadRequested.connect(controller.unload_async)
+    overlay.quitRequested.connect(quit_app)
     controller.stopFinished.connect(
         lambda ok, message: toast.show_toast(
             "Ollama stopped" if ok else "Couldn't stop Ollama",
@@ -898,6 +966,12 @@ def main(argv=None):
         conn.disconnectFromServer()
 
     instance_lock.newConnection.connect(on_instance_message)
+
+    claude_watcher = ClaudeWatcher(
+        usage_refresh_s=float(settings.section("claude").get("usage_refresh_s", 15) or 15))
+    claude_watcher.updated.connect(overlay.on_claude_status)
+    if settings.section("claude").get("show", True):
+        claude_watcher.start()
 
     apply_runtime_settings()
     monitor.start()

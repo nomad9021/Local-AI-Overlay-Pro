@@ -881,6 +881,29 @@ class GeneralPage(QWidget):
         f.addRow("", self.auto_hide)
         right.addWidget(remote)
 
+        claude = QGroupBox("Claude")
+        f = QFormLayout(claude)
+        self.claude_show = QCheckBox("Show Claude sessions and token usage")
+        self.claude_busy = QCheckBox("Keep the overlay up while a session is generating")
+        self.claude_idle_only = QCheckBox("Only when no Ollama model is loaded")
+        self.claude_colour = ColorButton()
+        self.claude_sessions = QSpinBox()
+        self.claude_sessions.setRange(1, 12)
+        self.claude_refresh = QSpinBox()
+        self.claude_refresh.setRange(5, 300)
+        self.claude_refresh.setSuffix(" s")
+        f.addRow("", self.claude_show)
+        f.addRow("", self.claude_idle_only)
+        f.addRow("", self.claude_busy)
+        f.addRow("Border colour", self.claude_colour)
+        f.addRow("Session rows", self.claude_sessions)
+        f.addRow("Usage refresh", self.claude_refresh)
+        f.addRow("", hint("Sessions come from ~/.claude/sessions; token counts are measured "
+                          "from Claude Code's own transcripts on this machine. This is token "
+                          "volume, not a percentage of your plan limit \u2014 only Claude Code's "
+                          "/usage can show that."))
+        right.addWidget(claude)
+
         notes = QGroupBox("Notifications")
         f = QFormLayout(notes)
         self.toasts = QCheckBox("Show toasts")
@@ -941,6 +964,13 @@ class GeneralPage(QWidget):
         self.offline_toasts.setChecked(bool(n.get("host_offline_toasts", True)))
         self.remote_model_toasts.setChecked(bool(n.get("remote_model_toasts", False)))
         self.toast_secs.setValue(int(n.get("toast_seconds", 4)))
+        c = d.get("claude", {})
+        self.claude_show.setChecked(bool(c.get("show", True)))
+        self.claude_busy.setChecked(bool(c.get("show_when_busy", True)))
+        self.claude_idle_only.setChecked(bool(c.get("only_when_idle", True)))
+        self.claude_colour.set_colour(c.get("color", "#D97757"))
+        self.claude_sessions.setValue(int(c.get("max_sessions", 4)))
+        self.claude_refresh.setValue(int(c.get("usage_refresh_s", 15)))
 
     def store(self):
         d = self._window.draft
@@ -955,6 +985,14 @@ class GeneralPage(QWidget):
         d["pinned_models"] = split_list(self.pinned.text())
         d["remote_poll_interval_s"] = self.remote_poll.value()
         d["behavior"]["auto_hide_when_idle"] = self.auto_hide.isChecked()
+        d.setdefault("claude", {}).update({
+            "show": self.claude_show.isChecked(),
+            "show_when_busy": self.claude_busy.isChecked(),
+            "only_when_idle": self.claude_idle_only.isChecked(),
+            "color": self.claude_colour.colour(),
+            "max_sessions": self.claude_sessions.value(),
+            "usage_refresh_s": self.claude_refresh.value(),
+        })
         d["notifications"].update({
             "toasts": self.toasts.isChecked(),
             "host_offline_toasts": self.offline_toasts.isChecked(),

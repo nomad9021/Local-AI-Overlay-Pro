@@ -6,6 +6,13 @@ Widgets shared by the HUD and the dashboard.
   tag, a kind badge (local / computer / server), the host's tags as coloured
   pills, its model rows, and its GPU/VRAM bars. The HUD stacks one per host;
   the dashboard lays them out in a grid with an extra detail line.
+- `WindowControls` — the overlay's own minimise/close buttons. They live in
+  the header row of whichever card is on top rather than in a separate title
+  bar, so the overlay is nothing but cards.
+- `ClaudeCard` — Claude Code sessions on this machine and the token volume
+  through them, drawn in the same visual language: a session that is generating
+  reads green like an active model, one waiting for input reads amber like a
+  warm one.
 """
 import time
 
@@ -16,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 import theme
+from claude_watch import ClaudeStatus, fmt_tokens
 from gpu_stats import GPUStats
 from model_state import ModelState
 from monitor import ModelStatus
@@ -47,6 +55,48 @@ class Bar(QWidget):
         p.drawRoundedRect(0, 0, w, h, 2, 2)
         p.setBrush(QBrush(QColor(self.color)))
         p.drawRoundedRect(0, 0, int(w * self.value), h, 2, 2)
+
+
+class WindowControls(QWidget):
+    """The overlay's minimise and close buttons.
+
+    One instance is moved between cards: whichever card is currently on top
+    hosts it, so the controls always sit in the overlay's top-right corner
+    without a title bar of their own to live in.
+    """
+
+    minimizeToggled = Signal()
+    closeClicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        self.minimize_btn = self._button("\u2013", 13, "Collapse the overlay")
+        self.minimize_btn.clicked.connect(lambda *_: self.minimizeToggled.emit())
+        self.close_btn = self._button("\u00d7", 15, "Hide the overlay (the tray icon brings it back)")
+        self.close_btn.clicked.connect(lambda *_: self.closeClicked.emit())
+        row.addWidget(self.minimize_btn)
+        row.addWidget(self.close_btn)
+
+    @staticmethod
+    def _button(glyph, size, tooltip):
+        btn = QPushButton(glyph)
+        btn.setFixedSize(14, 14)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(
+            "QPushButton { background: transparent; color: %s; border: none;"
+            " font-size: %dpx; font-weight: bold; padding: 0; }"
+            " QPushButton:hover { color: white; }" % (LABEL_GRAY, size)
+        )
+        return btn
+
+    def set_minimized(self, minimized: bool):
+        self.minimize_btn.setText("+" if minimized else "\u2013")
+        self.minimize_btn.setToolTip("Expand the overlay" if minimized
+                                     else "Collapse the overlay")
 
 
 class ModelRow(QWidget):
@@ -262,6 +312,7 @@ class HostCard(QFrame):
         header.addWidget(self.status_label)
         header.addWidget(self.collapse_btn)
         layout.addLayout(header)
+        self._header_row = header
 
         self.tag_container = QWidget()
         self.tag_row = QHBoxLayout(self.tag_container)
@@ -315,6 +366,12 @@ class HostCard(QFrame):
         row.addWidget(bar, 1)
         row.addWidget(value)
         return container, bar, value
+
+    def set_window_controls(self, controls):
+        """Host the overlay's minimise/close buttons in this card's header."""
+        if controls is not None:
+            self._header_row.addWidget(controls)
+            controls.setVisible(True)
 
     def _apply_frame_style(self):
         width, radius, alpha = self._border
@@ -494,3 +551,276 @@ class HostCard(QFrame):
             return
         for row in self._rows.values():
             row.refresh_countdown()
+
+
+class ClaudeSessionRow(QWidget):
+    """One Claude Code session: dot, name, and a BUSY/IDLE pill."""
+
+    def __init__(self, width: int, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 1, 0, 1)
+        row.setSpacing(6)
+        self.dot = QLabel("●")
+        self.dot.setFont(mono(6))
+        self.name = QLabel("")
+        self.name.setFont(mono(8))
+        self.name.setStyleSheet("color: white;")
+        self.pill = QLabel("")
+        self.pill.setFont(mono(6, QFont.DemiBold))
+        self.pill.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.dot)
+        row.addWidget(self.name)
+        row.addStretch()
+        row.addWidget(self.pill)
+        self._width = width
+
+    def set_width(self, width: int):
+        self._width = width
+
+    def set_session(self, session):
+        # Busy reads green and idle amber, the same way an active model row and
+        # a warm one do, so the whole HUD is read with one colour vocabulary.
+        state = ModelState.ACTIVE if session.busy else ModelState.WAITING
+        colour = theme.state_colour(state)
+        self.dot.setStyleSheet("color: %s;" % colour)
+        metrics = QFontMetrics(self.name.font())
+        self.name.setText(metrics.elidedText(session.label, Qt.ElideRight,
+                                             max(60, self._width - 118)))
+        self.name.setStyleSheet("color: white;" if session.busy
+                                else "color: %s;" % LABEL_GRAY)
+        self.pill.setText("BUSY" if session.busy else "IDLE")
+        self.pill.setStyleSheet(pill_style(colour, radius=5))
+        detail = [session.label]
+        if session.cwd:
+            detail.append(session.cwd)
+        tail = "%s · pid %s" % (session.entrypoint or "claude", session.pid)
+        if session.version:
+            tail += " · v%s" % session.version
+        detail.append(tail)
+        self.setToolTip("\n".join(detail))
+
+
+class ClaudeCard(QFrame):
+    """Claude on this machine: desktop app, live sessions, token volume.
+
+    The token figures are measured from Claude Code's own transcripts. They are
+    deliberately *not* presented as a percentage of a plan limit: that number is
+    only available inside Claude Code's own `/usage` view, so any percentage
+    shown here would be invented.
+    """
+
+    PAD_X = 12
+    USAGE_WINDOWS = (("5h", "5h"), ("7d", "7d"))
+
+    def __init__(self, width: int = 272, parent=None):
+        super().__init__(parent)
+        self.setObjectName("claudecard")
+        self._width = width
+        self._colour = theme.ACCENT
+        self._border = (1, 14, 175)
+        self._max_sessions = 4
+        self._rows = []
+        self._collapsed = False
+        self._status = ClaudeStatus()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(self.PAD_X, 10, self.PAD_X, 10)
+        layout.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(6)
+        self.name_pill = QLabel("CLAUDE")
+        self.name_pill.setFont(mono(8, QFont.DemiBold))
+        self.summary = QLabel("")
+        self.summary.setFont(mono(7))
+        self.summary.setStyleSheet("color: %s;" % LABEL_GRAY)
+        self.summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        head.addWidget(self.name_pill)
+        head.addStretch()
+        head.addWidget(self.summary)
+        layout.addLayout(head)
+        self._header_row = head
+
+        self.sessions_box = QVBoxLayout()
+        self.sessions_box.setContentsMargins(0, 0, 0, 0)
+        self.sessions_box.setSpacing(1)
+        layout.addLayout(self.sessions_box)
+
+        self.more_label = QLabel("")
+        self.more_label.setFont(mono(7))
+        self.more_label.setStyleSheet("color: %s;" % LABEL_GRAY)
+        layout.addWidget(self.more_label)
+
+        self.message = QLabel("")
+        self.message.setFont(mono(8))
+        self.message.setStyleSheet("color: %s;" % LABEL_GRAY)
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+
+        self.usage_rows = {}
+        for key, caption in self.USAGE_WINDOWS:
+            container = QWidget()
+            line = QHBoxLayout(container)
+            line.setContentsMargins(0, 0, 0, 0)
+            cap = QLabel(caption)
+            cap.setFont(mono(8))
+            cap.setStyleSheet("color: %s;" % LABEL_GRAY)
+            cap.setFixedWidth(26)
+            value = QLabel("—")
+            value.setFont(mono(8, QFont.DemiBold))
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            line.addWidget(cap)
+            line.addStretch()
+            line.addWidget(value)
+            layout.addWidget(container)
+            self.usage_rows[key] = (container, value)
+
+        self._apply_frame_style()
+        self.setFixedWidth(width)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Maximum)
+
+    # ---- configuration ---------------------------------------------------- #
+
+    def set_window_controls(self, controls):
+        """Host the overlay's minimise/close buttons in this card's header."""
+        if controls is not None:
+            self._header_row.addWidget(controls)
+            controls.setVisible(True)
+
+    def set_collapsed(self, collapsed: bool):
+        """Collapse to the header row, matching HostCard's own collapse."""
+        self._collapsed = bool(collapsed)
+        self._apply_visibility()
+
+    @property
+    def collapsed(self) -> bool:
+        return self._collapsed
+
+    def _apply_visibility(self):
+        expanded = not self._collapsed
+        for index, row in enumerate(self._rows):
+            row.setVisible(expanded and index < len(self._status.sessions))
+        hidden = len(self._status.sessions) - min(len(self._rows), self._max_sessions)
+        self.more_label.setVisible(expanded and hidden > 0)
+        self.message.setVisible(expanded and bool(self.message.text()))
+        for key, (container, _value) in self.usage_rows.items():
+            usage = self._status.usage.get(key)
+            container.setVisible(expanded and usage is not None and not usage.empty)
+
+    def _apply_frame_style(self):
+        width, radius, alpha = self._border
+        self.setStyleSheet("""
+            #claudecard {
+                background: rgba(18, 18, 20, %d);
+                border: %dpx solid %s;
+                border-radius: %dpx;
+            }
+        """ % (alpha, width, rgba(self._colour, 190), radius))
+        self.name_pill.setStyleSheet(
+            "color: #0f0f10; background: %s; border-radius: 6px; padding: 1px 6px;" % self._colour
+        )
+
+    def set_appearance(self, width: int, border_width: int, radius: int, alpha: int,
+                       colour: str, max_sessions: int):
+        self._width = width
+        self._colour = theme.valid_colour(colour, theme.ACCENT)
+        self._border = (border_width, radius, alpha)
+        self._max_sessions = max(1, int(max_sessions))
+        self.setFixedWidth(width)
+        for row in self._rows:
+            row.set_width(width)
+        self._apply_frame_style()
+        self.set_status(self._status)
+
+    # ---- content ---------------------------------------------------------- #
+
+    def set_status(self, status):
+        self._status = status or ClaudeStatus()
+        status = self._status
+
+        sessions = status.sessions[: self._max_sessions]
+        while len(self._rows) < len(sessions):
+            row = ClaudeSessionRow(self._width)
+            self._rows.append(row)
+            self.sessions_box.addWidget(row)
+        for index, row in enumerate(self._rows):
+            if index < len(sessions):
+                row.set_session(sessions[index])
+            row.setVisible(index < len(sessions))
+
+        hidden = len(status.sessions) - len(sessions)
+        self.more_label.setText("+%d more" % hidden if hidden > 0 else "")
+        self.more_label.setVisible(hidden > 0)
+
+        self.summary.setText(self._summary_text(status))
+        self._set_message(status)
+        self._set_usage(status)
+        self._apply_visibility()
+        self.setToolTip(self._tooltip(status))
+
+    @staticmethod
+    def _summary_text(status) -> str:
+        if not status.available:
+            return "not installed"
+        if not status.running:
+            return "not running"
+        parts = []
+        if status.busy_sessions:
+            parts.append("%d busy" % status.busy_sessions)
+        if status.sessions:
+            count = len(status.sessions)
+            parts.append("%d session%s" % (count, "" if count == 1 else "s"))
+        elif status.app_running:
+            parts.append("app open")
+        return " · ".join(parts)
+
+    def _set_message(self, status):
+        text = ""
+        if not status.available:
+            text = "No ~/.claude on this machine."
+        elif not status.running:
+            text = "Claude isn't running."
+        elif not status.sessions and status.app_running:
+            text = "Desktop app open, no sessions."
+        self.message.setText(text)
+        self.message.setVisible(bool(text))
+
+    def _set_usage(self, status):
+        for key, (container, value) in self.usage_rows.items():
+            usage = status.usage.get(key)
+            if usage is None or usage.empty:
+                # Nothing measured in this window: hide the row rather than
+                # showing a zero that reads like "you used nothing".
+                container.setVisible(False)
+                continue
+            container.setVisible(True)
+            value.setText("%s out · %s in" % (fmt_tokens(usage.output_tokens),
+                                                   fmt_tokens(usage.fresh_input)))
+            value.setStyleSheet("color: %s;" % theme.ACCENT)
+
+    @staticmethod
+    def _tooltip(status) -> str:
+        lines = ["Claude on this machine"]
+        if status.app_running:
+            lines.append("desktop app running (%d helper processes)" % status.app_helpers)
+        lines.append("%d live session(s), %d generating"
+                     % (len(status.sessions), status.busy_sessions))
+        for key in ("5h", "today", "7d"):
+            usage = status.usage.get(key)
+            if usage is None or usage.empty:
+                continue
+            lines.append("%s: %s out, %s in, %s cache-read, %d replies"
+                         % (key, fmt_tokens(usage.output_tokens),
+                            fmt_tokens(usage.fresh_input),
+                            fmt_tokens(usage.cache_read), usage.messages))
+            if key == "7d":
+                models = {m: v for m, v in usage.by_model.items() if not m.startswith("<")}
+                for name, counts in sorted(models.items(), key=lambda kv: -kv[1][1])[:4]:
+                    lines.append("    %s: %s out" % (name, fmt_tokens(counts[1])))
+        if status.usage_error:
+            lines.append(status.usage_error)
+        lines.append("Measured from local transcripts — not a plan-limit "
+                     "percentage, which only Claude Code's /usage can show.")
+        return "\n".join(lines)
